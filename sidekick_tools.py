@@ -19,6 +19,11 @@ from langchain_experimental.tools import PythonREPLTool
 from langchain_community.utilities import GoogleSerperAPIWrapper
 # Wikipedia API utilities for content retrieval
 from langchain_community.utilities.wikipedia import WikipediaAPIWrapper
+# Markdown to HTML conversion for PDF generation
+import markdown
+# Async support and file path handling
+import asyncio
+from datetime import datetime
 
 # Load environment variables for API keys and tokens
 load_dotenv(override=True)
@@ -60,6 +65,99 @@ def get_file_tools():
     return toolkit.get_tools()
 
 
+# Markdown to PDF conversion using Playwright
+# Converts markdown content to PDF and saves to sandbox directory
+async def markdown_to_pdf(markdown_content: str, filename: str = None) -> str:
+    """Convert markdown content to PDF using Playwright browser engine"""
+    try:
+        # Generate filename if not provided
+        if not filename:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"markdown_document_{timestamp}.pdf"
+        
+        # Ensure filename ends with .pdf
+        if not filename.endswith('.pdf'):
+            filename += '.pdf'
+        
+        # Convert markdown to HTML
+        html_content = markdown.markdown(markdown_content, extensions=['tables', 'fenced_code'])
+        
+        # Create full HTML document with basic styling
+        full_html = f"""
+        <!DOCTYPE html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <style>
+                body {{ font-family: Arial, sans-serif; line-height: 1.6; margin: 40px; }}
+                h1, h2, h3 {{ color: #333; }}
+                code {{ background-color: #f4f4f4; padding: 2px 4px; border-radius: 3px; }}
+                pre {{ background-color: #f4f4f4; padding: 10px; border-radius: 5px; overflow-x: auto; }}
+                table {{ border-collapse: collapse; width: 100%; }}
+                th, td {{ border: 1px solid #ddd; padding: 8px; text-align: left; }}
+                th {{ background-color: #f2f2f2; }}
+            </style>
+        </head>
+        <body>
+            {html_content}
+        </body>
+        </html>
+        """
+        
+        # Initialize Playwright for PDF generation
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=True)
+        page = await browser.new_page()
+        
+        # Set HTML content and generate PDF
+        await page.set_content(full_html, wait_until="networkidle")
+        
+        # Save PDF to sandbox directory
+        pdf_path = os.path.join("sandbox", filename)
+        await page.pdf(path=pdf_path, format="A4", print_background=True)
+        
+        # Cleanup
+        await browser.close()
+        await playwright.stop()
+        
+        return f"Successfully created PDF: {pdf_path}"
+        
+    except Exception as e:
+        return f"Error creating PDF: {str(e)}"
+
+
+# Synchronous wrapper for markdown_to_pdf to use with LangChain Tool
+def markdown_to_pdf_sync(input_string: str) -> str:
+    """Synchronous wrapper for markdown_to_pdf function
+    
+    Input format: 'FILENAME:filename\nmarkdown_content' or just 'markdown_content'
+    """
+    try:
+        # Parse input - check if filename is provided at the start
+        lines = input_string.strip().split('\n', 1)
+        
+        if lines[0].startswith('FILENAME:'):
+            # Extract filename and remaining content
+            filename = lines[0].replace('FILENAME:', '').strip()
+            markdown_content = lines[1] if len(lines) > 1 else ""
+        else:
+            # No filename provided, use entire input as markdown content
+            filename = None
+            markdown_content = input_string.strip()
+        
+        # Run async function in event loop
+        try:
+            loop = asyncio.get_running_loop()
+            # If we're in an async context, create a task
+            task = loop.create_task(markdown_to_pdf(markdown_content, filename))
+            return "PDF generation started. Check sandbox directory for output."
+        except RuntimeError:
+            # If no event loop is running, create one
+            return asyncio.run(markdown_to_pdf(markdown_content, filename))
+    except Exception as e:
+        return f"Error processing markdown to PDF: {str(e)}"
+
+
 # Async function to initialize and configure additional agent tools
 # Combines various capabilities: notifications, files, search, knowledge, and code execution
 async def other_tools():
@@ -82,5 +180,12 @@ async def other_tools():
     # Python REPL for code execution and data analysis
     python_repl = PythonREPLTool()
     
+    # Markdown to PDF conversion tool
+    pdf_tool = Tool(
+        name="markdown_to_pdf",
+        func=markdown_to_pdf_sync,
+        description="Convert markdown content to PDF. Input format: 'FILENAME:filename\\nmarkdown_content' or just 'markdown_content'. Saves PDF to sandbox directory."
+    )
+    
     # Combine all tools into a single list for the agent
-    return file_tools + [push_tool, tool_search, python_repl,  wiki_tool]
+    return file_tools + [push_tool, tool_search, python_repl, wiki_tool, pdf_tool]

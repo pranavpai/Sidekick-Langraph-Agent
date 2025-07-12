@@ -10,6 +10,7 @@ dependencies = [
     "langchain-core",
     "langchain-community",
     "langchain-experimental",
+    "markdown",
     "python-dotenv",
     "pydantic",
     "playwright",

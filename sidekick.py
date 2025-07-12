@@ -40,6 +40,10 @@ class State(TypedDict):
     user_input_needed: bool
     # Counter to track worker-evaluator iterations
     iteration_count: int
+    # High-level execution plan created by the planner
+    execution_plan: Optional[str]
+    # Counter to track planner iterations for replanning scenarios
+    planner_iterations: int
 
 
 # Pydantic model for structured evaluator output using LangChain's structured output feature
@@ -53,6 +57,19 @@ class EvaluatorOutput(BaseModel):
     user_input_needed: bool = Field(description="True if more input is needed from the user, or clarifications, or the assistant is stuck")
 
 
+# Pydantic model for structured planner output using LangChain's structured output feature
+# Ensures the planner creates consistent, actionable execution plans for the worker
+class PlannerOutput(BaseModel):
+    # High-level strategy and approach for completing the task
+    strategy: str = Field(description="Overall strategy and approach for the task")
+    # Ordered list of specific steps the worker should execute
+    execution_steps: List[str] = Field(description="Ordered list of specific steps to complete the task")
+    # Tools and resources the worker should prioritize using
+    recommended_tools: List[str] = Field(description="Tools and resources the worker should use")
+    # Key considerations, constraints, or requirements to keep in mind
+    considerations: str = Field(description="Important considerations, constraints, or requirements")
+
+
 # Main Sidekick agent class implementing a worker-evaluator pattern with LangGraph
 # Combines task execution (worker) with quality assessment (evaluator) in a stateful workflow
 class Sidekick:
@@ -61,6 +78,8 @@ class Sidekick:
         self.worker_llm_with_tools = None
         # Evaluator LLM configured for structured output assessment
         self.evaluator_llm_with_output = None
+        # Planner LLM configured for structured plan generation
+        self.planner_llm_with_output = None
         # Collection of available tools (browser, files, search, etc.)
         self.tools = None
         # Legacy field kept for compatibility
@@ -90,8 +109,185 @@ class Sidekick:
         evaluator_llm = ChatOpenAI(model="gpt-4o-mini")
         # Configure evaluator for structured output using Pydantic model
         self.evaluator_llm_with_output = evaluator_llm.with_structured_output(EvaluatorOutput)
+        # Create separate planner LLM instance for strategic planning
+        planner_llm = ChatOpenAI(model="gpt-4o-mini")
+        # Configure planner for structured output using Pydantic model
+        self.planner_llm_with_output = planner_llm.with_structured_output(PlannerOutput)
         # Build the LangGraph workflow with nodes, edges, and routing logic
         await self.build_graph()
+
+    # Generate clarifying questions for user input
+    # Uses LLM to create 3 relevant questions that could improve task understanding
+    async def generate_clarifying_questions(self, message: str, success_criteria: str) -> List[str]:
+        """Generate 3 clarifying questions based on user input to improve task understanding"""
+        
+        # System prompt for clarifying questions generation
+        system_prompt = """You are a helpful assistant that generates clarifying questions to better understand user requests.
+        
+Your task is to analyze the user's request and success criteria, then generate exactly 3 relevant clarifying questions that would help you provide a better, more tailored response.
+
+Guidelines for good clarifying questions:
+- Ask about specific preferences, constraints, or requirements
+- Focus on ambiguous aspects of the request
+- Ask about scope, format, or level of detail desired
+- Consider technical vs non-technical audience needs
+- Ask about timeline, resources, or limitations
+- Avoid yes/no questions when possible
+- Make questions specific and actionable
+
+Respond with exactly 3 questions, one per line, without numbering or bullet points."""
+
+        # User prompt with the actual request
+        user_prompt = f"""User Request: {message}
+
+Success Criteria: {success_criteria}
+
+Please generate 3 clarifying questions that would help you provide the best possible response to this request."""
+
+        # Create messages for the LLM
+        messages = [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_prompt)
+        ]
+        
+        try:
+            # Use worker LLM (without tools) for question generation
+            llm = ChatOpenAI(model="gpt-4o-mini")
+            response = await llm.ainvoke(messages)
+            
+            # Parse the response into individual questions
+            questions_text = response.content.strip()
+            questions = [q.strip() for q in questions_text.split('\n') if q.strip()]
+            
+            # Ensure we have exactly 3 questions
+            if len(questions) < 3:
+                # Pad with generic questions if needed
+                while len(questions) < 3:
+                    questions.append("Are there any specific preferences or requirements I should consider?")
+            elif len(questions) > 3:
+                # Take only the first 3 questions
+                questions = questions[:3]
+            
+            return questions
+            
+        except Exception as e:
+            # Fallback questions if generation fails
+            print(f"Error generating clarifying questions: {e}")
+            return [
+                "What specific format or style would you prefer for the response?",
+                "Are there any constraints or limitations I should be aware of?",
+                "What level of detail would be most helpful for your needs?"
+            ]
+
+    # Planner node: Strategic planning component of the LangGraph workflow
+    # Analyzes user request and creates detailed execution plan for the worker
+    def planner(self, state: State) -> Dict[str, Any]:
+        """Generate strategic execution plan based on user request and available tools"""
+        current_planner_iteration = state.get("planner_iterations", 0)
+        current_iteration = state.get("iteration_count", 0)
+        
+        # Extract the user's original request from messages
+        original_request = ""
+        for message in state["messages"]:
+            if isinstance(message, HumanMessage):
+                original_request = message.content
+                break
+        
+        # Create available tools list for planning context
+        tool_names = [tool.name for tool in self.tools] if self.tools else []
+        tools_description = ", ".join(tool_names)
+        
+        # Dynamic system prompt for strategic planning
+        system_message = f"""You are a strategic planner that creates detailed execution plans for an AI agent.
+        
+Your task is to analyze the user's request and create a comprehensive, actionable plan that a worker agent can follow.
+
+Available tools for the worker: {tools_description}
+
+The current date and time is {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}
+
+This is planner iteration {current_planner_iteration + 1}, overall iteration {current_iteration}.
+
+Create a strategic plan that:
+1. Breaks down the task into logical, sequential steps
+2. Recommends appropriate tools for each phase
+3. Considers potential challenges and mitigation strategies
+4. Ensures the plan aligns with the success criteria
+
+Be specific and actionable in your planning. The worker will execute your plan step-by-step."""
+
+        # Include feedback from evaluator for replanning scenarios
+        user_message = f"""User Request: {original_request}
+
+Success Criteria: {state['success_criteria']}"""
+
+        if state.get("feedback_on_work"):
+            user_message += f"""
+
+Previous Attempt Feedback: {state['feedback_on_work']}
+
+Please create a revised plan that addresses the feedback and improves upon the previous approach."""
+
+        if state.get("execution_plan"):
+            user_message += f"""
+
+Previous Plan: {state['execution_plan']}
+
+Consider what worked and what didn't work in the previous plan when creating the new one."""
+
+        # Create messages for planner LLM
+        planner_messages = [
+            SystemMessage(content=system_message),
+            HumanMessage(content=user_message)
+        ]
+        
+        try:
+            # Invoke planner LLM with structured output
+            plan_result = self.planner_llm_with_output.invoke(planner_messages)
+            
+            # Format the plan into a comprehensive execution plan string
+            execution_plan = f"""
+STRATEGY: {plan_result.strategy}
+
+EXECUTION STEPS:
+{chr(10).join([f"{i+1}. {step}" for i, step in enumerate(plan_result.execution_steps)])}
+
+RECOMMENDED TOOLS: {', '.join(plan_result.recommended_tools)}
+
+CONSIDERATIONS: {plan_result.considerations}
+            """.strip()
+            
+            # Create plan summary message
+            plan_message = f"Planning Phase: Created execution plan with {len(plan_result.execution_steps)} steps using strategy: {plan_result.strategy[:100]}..."
+            
+            return {
+                "messages": [AIMessage(content=plan_message)],
+                "execution_plan": execution_plan,
+                "planner_iterations": current_planner_iteration + 1
+            }
+            
+        except Exception as e:
+            # Fallback plan if planning fails
+            fallback_plan = f"""
+STRATEGY: Direct approach to complete the user's request
+
+EXECUTION STEPS:
+1. Analyze the request and success criteria carefully
+2. Use available tools to research and gather information as needed
+3. Execute the task step by step
+4. Verify the output meets the success criteria
+
+RECOMMENDED TOOLS: {tools_description}
+
+CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
+            """.strip()
+            
+            print(f"Error in planner: {e}")
+            return {
+                "messages": [AIMessage(content=f"Planning Phase: Using fallback plan due to error: {str(e)[:100]}...")],
+                "execution_plan": fallback_plan,
+                "planner_iterations": current_planner_iteration + 1
+            }
 
     # Worker node: Core task execution component of the LangGraph workflow
     # Receives state, processes tasks with tools, and returns updated state
@@ -117,6 +313,17 @@ class Sidekick:
 
     If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
     """
+        
+        # Include execution plan from planner if available
+        if state.get("execution_plan"):
+            system_message += f"""
+    
+    EXECUTION PLAN:
+    You have been provided with a strategic execution plan created by a planner. Follow this plan as a guide for completing the task:
+    
+    {state['execution_plan']}
+    
+    Use this plan to structure your approach, but adapt as needed based on the actual results you encounter."""
         
         # Include evaluator feedback for iterative improvement if available
         if state.get("feedback_on_work"):
@@ -239,24 +446,58 @@ class Sidekick:
         return new_state
 
     # Conditional edge function: Controls workflow continuation based on evaluation
-    # Determines whether to end the workflow or continue with another worker iteration
+    # Determines whether to end the workflow, continue with worker, or replan
     def route_based_on_evaluation(self, state: State) -> str:
         # End workflow if task is complete or requires user intervention
         if state["success_criteria_met"] or state["user_input_needed"]:
             return "END"
-        # Continue iterating with worker if task needs more work
+        
+        current_iteration = state.get("iteration_count", 0)
+        planner_iterations = state.get("planner_iterations", 0)
+        feedback = state.get("feedback_on_work", "")
+        
+        print(f"🔀 [ROUTING] Iteration {current_iteration}, Planner iterations: {planner_iterations}")
+        
+        # AGGRESSIVE TIMEOUT PREVENTION: Force end after reasonable iterations
+        if current_iteration >= 15:  # Reduced from 20 for faster timeout prevention
+            print(f"⏰ [ROUTING] Force ending due to high iteration count: {current_iteration}")
+            return "END"
+        
+        # CONSERVATIVE REPLANNING: Only replan in very specific circumstances
+        should_replan = False
+        
+        # Only replan if we have clear indicators and low planner iterations
+        if planner_iterations < 2:  # Reduced from 3 to limit replanning
+            # Replan only at specific iteration thresholds (less frequent)
+            if current_iteration == 7:  # Single replan opportunity instead of every 5
+                should_replan = True
+                print(f"🔄 [ROUTING] Replanning at iteration threshold: {current_iteration}")
+            
+            # Replan if feedback explicitly suggests fundamental issues
+            replan_keywords = ["different approach", "strategy", "plan", "reconsider", "rethink"]
+            if feedback and any(keyword in feedback.lower() for keyword in replan_keywords):
+                should_replan = True
+                print(f"🔄 [ROUTING] Replanning due to feedback keywords")
+        
+        # Route based on decision
+        if should_replan:
+            print(f"➡️ [ROUTING] Routing to planner")
+            return "planner"
         else:
+            print(f"➡️ [ROUTING] Routing to worker")
             return "worker"
 
 
     # LangGraph workflow construction: Defines the agent's execution flow
-    # Creates a stateful graph with worker-evaluator pattern and tool integration
+    # Creates a stateful graph with planner-worker-evaluator pattern and tool integration
     async def build_graph(self):
         # Initialize StateGraph with our custom State schema
         graph_builder = StateGraph(State)
 
         # Add nodes: Core components of the agent workflow
-        # Worker node: Primary task execution with LLM and tools
+        # Planner node: Strategic planning and task breakdown
+        graph_builder.add_node("planner", self.planner)
+        # Worker node: Task execution with LLM and tools following the plan
         graph_builder.add_node("worker", self.worker)
         # Tools node: Pre-built LangGraph component for handling tool execution
         graph_builder.add_node("tools", ToolNode(tools=self.tools))
@@ -264,14 +505,16 @@ class Sidekick:
         graph_builder.add_node("evaluator", self.evaluator)
 
         # Add edges: Define the workflow execution paths
+        # Entry point: Start workflow with planner node for strategic planning
+        graph_builder.add_edge(START, "planner")
+        # Direct edge: Planner always proceeds to worker with the execution plan
+        graph_builder.add_edge("planner", "worker")
         # Conditional edge from worker: Route to tools or evaluator based on output
         graph_builder.add_conditional_edges("worker", self.worker_router, {"tools": "tools", "evaluator": "evaluator"})
         # Direct edge: Tools always return to worker for processing results
         graph_builder.add_edge("tools", "worker")
-        # Conditional edge from evaluator: Continue or end based on assessment
-        graph_builder.add_conditional_edges("evaluator", self.route_based_on_evaluation, {"worker": "worker", "END": END})
-        # Entry point: Start workflow with worker node
-        graph_builder.add_edge(START, "worker")
+        # Conditional edge from evaluator: Continue, replan, or end based on assessment
+        graph_builder.add_conditional_edges("evaluator", self.route_based_on_evaluation, {"worker": "worker", "planner": "planner", "END": END})
 
         # Compile graph with memory persistence for conversation continuity
         self.graph = graph_builder.compile(checkpointer=self.memory)
@@ -279,27 +522,70 @@ class Sidekick:
     # Main execution method: Runs the complete agent workflow for a single interaction
     # Manages state initialization, graph execution, and result formatting
     async def run_superstep(self, message, success_criteria, history):
-        # Configuration for LangGraph execution with thread-based memory
-        config = {"configurable": {"thread_id": self.sidekick_id}}
+        import time
+        start_time = time.time()
+        print(f"\n🎯 [SUPERSTEP] Starting run_superstep at {time.strftime('%H:%M:%S')}")
+        
+        try:
+            # Configuration for LangGraph execution with thread-based memory
+            config = {"configurable": {"thread_id": self.sidekick_id}}
 
-        # Initialize state for this execution cycle
-        state = {
-            "messages": message,
-            "success_criteria": success_criteria or "The answer should be clear and accurate",
-            "feedback_on_work": None,
-            "success_criteria_met": False,
-            "user_input_needed": False,
-            "iteration_count": 0
-        }
-        # Allow deep recursion for complex multi-step tasks - increased from 50 to 100
-        config["recursion_limit"] = 100
-        # Execute the compiled graph workflow asynchronously
-        result = await self.graph.ainvoke(state, config=config)
-        # Format results for Gradio chat interface
-        user = {"role": "user", "content": message}
-        reply = {"role": "assistant", "content": result["messages"][-2].content}
-        feedback = {"role": "assistant", "content": result["messages"][-1].content}
-        return history + [user, reply, feedback]
+            # Initialize state for this execution cycle
+            state = {
+                "messages": message,
+                "success_criteria": success_criteria or "The answer should be clear and accurate",
+                "feedback_on_work": None,
+                "success_criteria_met": False,
+                "user_input_needed": False,
+                "iteration_count": 0,
+                "execution_plan": None,
+                "planner_iterations": 0
+            }
+            
+            print(f"📊 [SUPERSTEP] State initialized with message length: {len(message) if message else 0}")
+            print(f"📊 [SUPERSTEP] Success criteria: {success_criteria[:100] if success_criteria else 'Default'}...")
+            
+            # Allow deep recursion for complex multi-step tasks - increased to handle planner-worker cycles
+            config["recursion_limit"] = 200  # Increased for complex clarifying workflows
+            print(f"⚙️ [SUPERSTEP] Config set with recursion_limit: {config['recursion_limit']}")
+            
+            # Execute the compiled graph workflow asynchronously
+            graph_start_time = time.time()
+            print(f"🚀 [SUPERSTEP] Starting graph execution at {time.strftime('%H:%M:%S')}")
+            result = await self.graph.ainvoke(state, config=config)
+            
+            graph_end_time = time.time()
+            print(f"✅ [SUPERSTEP] Graph execution completed at {time.strftime('%H:%M:%S')} (took {graph_end_time - graph_start_time:.2f}s)")
+            
+            # Log result details
+            print(f"📈 [SUPERSTEP] Result keys: {list(result.keys()) if result else 'None'}")
+            print(f"📈 [SUPERSTEP] Final iteration count: {result.get('iteration_count', 'Unknown')}")
+            print(f"📈 [SUPERSTEP] Planner iterations: {result.get('planner_iterations', 'Unknown')}")
+            print(f"📈 [SUPERSTEP] Success criteria met: {result.get('success_criteria_met', 'Unknown')}")
+            print(f"📈 [SUPERSTEP] Messages count: {len(result.get('messages', [])) if result else 0}")
+            
+            # Format results for Gradio chat interface
+            format_start_time = time.time()
+            user = {"role": "user", "content": message}
+            reply = {"role": "assistant", "content": result["messages"][-2].content}
+            feedback = {"role": "assistant", "content": result["messages"][-1].content}
+            
+            formatted_result = history + [user, reply, feedback]
+            format_end_time = time.time()
+            
+            print(f"🎨 [SUPERSTEP] Result formatting took {format_end_time - format_start_time:.2f}s")
+            
+            total_time = time.time() - start_time
+            print(f"🏁 [SUPERSTEP] Total run_superstep time: {total_time:.2f}s")
+            
+            return formatted_result
+            
+        except Exception as e:
+            error_time = time.time()
+            print(f"❌ [SUPERSTEP] Error at {time.strftime('%H:%M:%S')} (after {error_time - start_time:.2f}s): {e}")
+            import traceback
+            traceback.print_exc()
+            raise e
     
     # Resource cleanup: Properly closes browser and Playwright instances
     # Handles both event loop and non-event loop contexts gracefully
