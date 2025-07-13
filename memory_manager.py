@@ -101,45 +101,28 @@ class MemoryManager:
         raise ValueError(f"Invalid thread ID format: {thread_id}")
 
     def _generate_conversation_title(self, message: str) -> str:
-        """Generate a meaningful conversation title from message content"""
+        """Generate a simple conversation title from first 50 chars of user message"""
         if not message or not message.strip():
             return DEFAULT_CONVERSATION_TITLE
 
         # Clean the message - remove extra whitespace and normalize
         cleaned_message = re.sub(r'\s+', ' ', message.strip())
+        
+        # Remove clarifying questions context if present
+        if "\n\nClarifying Questions and Answers:" in cleaned_message:
+            cleaned_message = cleaned_message.split("\n\nClarifying Questions and Answers:")[0].strip()
 
-        # Extract the first sentence or meaningful phrase
-        # Look for sentence endings or natural break points
-        sentences = re.split(r'[.!?]+', cleaned_message)
-        first_sentence = sentences[0].strip() if sentences else cleaned_message
-
-        # If first sentence is too short, try to include more context
-        if len(first_sentence) < 20 and len(sentences) > 1:
-            first_sentence = (first_sentence + " " + sentences[1].strip()).strip()
-
-        # Limit title length and clean it up
-        if len(first_sentence) > 60:
-            # Try to break at word boundaries
-            truncated = first_sentence[:60]
+        # Simple approach: take first 50 characters
+        if len(cleaned_message) <= 50:
+            title = cleaned_message
+        else:
+            # Truncate at word boundary if possible
+            truncated = cleaned_message[:50]
             last_space = truncated.rfind(' ')
             if last_space > 30:  # Only truncate at word boundary if reasonable
-                first_sentence = truncated[:last_space] + "..."
+                title = truncated[:last_space] + "..."
             else:
-                first_sentence = truncated + "..."
-
-        # Remove common prefixes that don't add value
-        title = first_sentence
-        prefixes_to_remove = [
-            "please", "can you", "could you", "would you", "i want", "i need",
-            "help me", "i would like", "could you please", "can you help"
-        ]
-
-        for prefix in prefixes_to_remove:
-            if title.lower().startswith(prefix.lower()):
-                title = title[len(prefix):].strip()
-                # Remove leading punctuation
-                title = re.sub(r'^[,\s]+', '', title)
-                break
+                title = truncated + "..."
 
         # Capitalize first letter
         if title:
@@ -268,6 +251,67 @@ class MemoryManager:
             print(f"Error updating conversation: {e}")
             return False
 
+    def clear_conversation_history(self, conversation_id: str, username: str) -> dict[str, Any]:
+        """Clear all messages from a conversation while keeping the conversation record"""
+        try:
+            print(f"🧹 [CLEAR_HISTORY] Starting clear for conversation: {conversation_id[:8]}... user: {username}")
+            
+            conversation = self.get_conversation(conversation_id, username)
+            if not conversation:
+                print(f"❌ [CLEAR_HISTORY] Conversation not found: {conversation_id}")
+                return {"success": False, "error": "Conversation not found"}
+
+            print(f"🧹 [CLEAR_HISTORY] Found conversation with thread_id: {conversation.thread_id}")
+
+            with sqlite3.connect(SIDEKICK_DB_PATH) as conn:
+                # Check current checkpoint count before clearing
+                cursor = conn.execute("SELECT COUNT(*) FROM checkpoints WHERE thread_id = ?", (conversation.thread_id,))
+                checkpoint_count_before = cursor.fetchone()[0]
+                print(f"🧹 [CLEAR_HISTORY] Found {checkpoint_count_before} checkpoints to clear")
+
+                # Check current writes count before clearing  
+                cursor = conn.execute("SELECT COUNT(*) FROM writes WHERE thread_id = ?", (conversation.thread_id,))
+                writes_count_before = cursor.fetchone()[0]
+                print(f"🧹 [CLEAR_HISTORY] Found {writes_count_before} writes to clear")
+
+                # Reset conversation to default state: title, message count, and timestamp
+                conn.execute("""
+                    UPDATE conversations 
+                    SET title = ?, message_count = 0, last_updated = CURRENT_TIMESTAMP
+                    WHERE id = ? AND username = ?
+                """, (DEFAULT_CONVERSATION_TITLE, conversation_id, username))
+
+                # Delete associated checkpoints (this clears the message history)
+                checkpoints_deleted = conn.execute("""
+                    DELETE FROM checkpoints 
+                    WHERE thread_id = ?
+                """, (conversation.thread_id,)).rowcount
+
+                # Delete associated writes (LangGraph state changes)
+                writes_deleted = conn.execute("""
+                    DELETE FROM writes 
+                    WHERE thread_id = ?
+                """, (conversation.thread_id,)).rowcount
+
+                conn.commit()
+
+                print(f"✅ [CLEAR_HISTORY] Deleted {checkpoints_deleted} checkpoints and {writes_deleted} writes")
+                print(f"✅ [CLEAR_HISTORY] Reset title to '{DEFAULT_CONVERSATION_TITLE}' and message count to 0")
+                print(f"✅ [CLEAR_HISTORY] Conversation history cleared successfully")
+
+            return {
+                "success": True, 
+                "message": "Conversation history cleared successfully",
+                "conversation_id": conversation_id,
+                "username": username
+            }
+
+        except Exception as e:
+            print(f"❌ [CLEAR_HISTORY] Error clearing conversation history: {e}")
+            import traceback
+            traceback.print_exc()
+            return {"success": False, "error": f"Failed to clear conversation history: {e!s}"}
+
     def delete_conversation(self, conversation_id: str, username: str) -> dict[str, Any]:
         """Delete a specific conversation and its checkpoints"""
         try:
@@ -321,19 +365,38 @@ class MemoryManager:
     def auto_title_conversation(self, conversation_id: str, username: str, message: str) -> bool:
         """Auto-generate and update conversation title based on first message"""
         try:
+            print(f"🏷️ [AUTO_TITLE] Starting auto-title for conversation {conversation_id[:8]}... for user {username}")
+            print(f"🏷️ [AUTO_TITLE] Message preview: {message[:100] if message else 'None'}...")
+            
             # Check if conversation still has default title
             conversation = self.get_conversation(conversation_id, username)
-            if not conversation or conversation.title != DEFAULT_CONVERSATION_TITLE:
-                return False  # Already has a custom title or doesn't exist
+            if not conversation:
+                print(f"⚠️ [AUTO_TITLE] Conversation not found: {conversation_id}")
+                return False
+                
+            print(f"🏷️ [AUTO_TITLE] Current title: '{conversation.title}'")
+            
+            if conversation.title != DEFAULT_CONVERSATION_TITLE:
+                print(f"🏷️ [AUTO_TITLE] Conversation already has custom title, skipping")
+                return False  # Already has a custom title
 
             # Generate new title from message
             new_title = self._generate_conversation_title(message)
+            print(f"🏷️ [AUTO_TITLE] Generated new title: '{new_title}'")
 
             # Update conversation with new title
-            return self.update_conversation(conversation_id, username, title=new_title)
+            success = self.update_conversation(conversation_id, username, title=new_title)
+            if success:
+                print(f"✅ [AUTO_TITLE] Successfully updated conversation title to: '{new_title}'")
+            else:
+                print(f"❌ [AUTO_TITLE] Failed to update conversation title")
+            
+            return success
 
         except Exception as e:
-            print(f"Error auto-titling conversation: {e}")
+            print(f"❌ [AUTO_TITLE] Error auto-titling conversation: {e}")
+            import traceback
+            traceback.print_exc()
             return False
 
     def get_user_conversation_count(self, username: str) -> int:

@@ -563,19 +563,28 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
 
     # Main execution method: Runs the complete agent workflow for a single interaction
     # Manages state initialization, graph execution, and result formatting
-    async def run_superstep(self, message, success_criteria, history):
+    async def run_superstep(self, message, success_criteria, history, original_message=None):
         import time
         start_time = time.time()
         print(f"\n🎯 [SUPERSTEP] Starting run_superstep at {time.strftime('%H:%M:%S')}")
         print(f"👤 [SUPERSTEP] User: {self.username}, Conversation: {self.conversation_id}, Thread: {self.thread_id}")
 
         try:
+            # Determine which message to use for storage vs LLM processing
+            # Use original_message for storage/auto-titling, enhanced message for LLM
+            message_for_storage = original_message if original_message is not None else message
+            message_for_llm = message
+            
+            print(f"📝 [SUPERSTEP] Message for storage: {message_for_storage[:100] if message_for_storage else 'None'}...")
+            print(f"🤖 [SUPERSTEP] Message for LLM: {message_for_llm[:100] if message_for_llm else 'None'}...")
+            
             # Configuration for LangGraph execution with user-specific thread-based memory
             config = {"configurable": {"thread_id": self.thread_id}}
 
             # Initialize state for this execution cycle
+            # Use enhanced message for LLM processing but store original for conversation history
             state = {
-                "messages": message,
+                "messages": message_for_llm,
                 "success_criteria": success_criteria or "The answer should be clear and accurate",
                 "feedback_on_work": None,
                 "success_criteria_met": False,
@@ -588,11 +597,12 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
             # Update conversation metadata if user context is available
             if self.username and self.conversation_id:
                 # Auto-title conversation based on first message if it has default title
+                # Use original message for titling, not enhanced message with clarifying context
                 try:
                     memory_manager.auto_title_conversation(
                         self.conversation_id,
                         self.username,
-                        message
+                        message_for_storage
                     )
                 except Exception as e:
                     print(f"Warning: Could not auto-title conversation: {e}")
@@ -626,13 +636,31 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
             print(f"📈 [SUPERSTEP] Success criteria met: {result.get('success_criteria_met', 'Unknown')}")
             print(f"📈 [SUPERSTEP] Messages count: {len(result.get('messages', [])) if result else 0}")
 
-            # Format results for Gradio chat interface
+            # Format results for Gradio chat interface with deduplication
             format_start_time = time.time()
-            user = {"role": "user", "content": message}
-            reply = {"role": "assistant", "content": result["messages"][-2].content}
-            feedback = {"role": "assistant", "content": result["messages"][-1].content}
-
-            formatted_result = history + [user, reply, feedback]
+            # Use original message for display, not enhanced message with clarifying context
+            user_message = {"role": "user", "content": message_for_storage}
+            
+            # Filter out internal system messages - only show main assistant response to user
+            # Find the last non-evaluator assistant message
+            assistant_response = None
+            for msg in reversed(result["messages"]):
+                if (hasattr(msg, 'content') and msg.content and 
+                    not msg.content.startswith("Evaluator Feedback") and
+                    not msg.content.startswith("Planning Phase")):
+                    assistant_response = msg.content
+                    break
+            
+            # Fallback to last message if no suitable response found
+            if not assistant_response and result["messages"]:
+                assistant_response = result["messages"][-1].content
+            
+            assistant_message = {"role": "assistant", "content": assistant_response or "I apologize, but I couldn't generate a proper response."}
+            
+            # Smart deduplication: only add messages if they're not already in history
+            formatted_result = self._merge_conversation_with_deduplication(
+                history, user_message, assistant_message
+            )
             format_end_time = time.time()
 
             print(f"🎨 [SUPERSTEP] Result formatting took {format_end_time - format_start_time:.2f}s")
@@ -673,29 +701,132 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
             async for checkpoint in self.memory.alist(config, limit=limit):
                 checkpoints.append(checkpoint)
 
-            # Extract messages from checkpoints
+            # Extract messages from the LATEST checkpoint only (to avoid duplication)
+            # Each checkpoint contains the complete conversation state, so we only need the most recent one
             raw_messages = []
-            for checkpoint in reversed(checkpoints[-limit:]):
-                if "messages" in checkpoint.checkpoint["channel_values"]:
-                    messages = checkpoint.checkpoint["channel_values"]["messages"]
-                    raw_messages.extend(messages)
+            if checkpoints:
+                latest_checkpoint = checkpoints[0]  # checkpoints are already in reverse order
+                if "messages" in latest_checkpoint.checkpoint["channel_values"]:
+                    raw_messages = latest_checkpoint.checkpoint["channel_values"]["messages"]
+                    print(f"📚 [HISTORY] Extracted {len(raw_messages)} messages from latest checkpoint")
 
             # CRITICAL: Validate and clean messages before processing
             cleaned_messages = self.validate_and_clean_messages(raw_messages)
 
-            # Format cleaned messages for UI display
-            for msg in cleaned_messages:
-                if hasattr(msg, 'content') and msg.content:
-                    if isinstance(msg, HumanMessage):
-                        history.append({"role": "user", "content": msg.content})
-                    elif isinstance(msg, AIMessage):
-                        history.append({"role": "assistant", "content": msg.content})
-
-            return history[-limit:] if history else []
+            # Advanced message filtering for UI display
+            seen_contents = set()  # Track seen content for deduplication
+            conversation_pairs = []  # Track user-assistant pairs
+            
+            print(f"📚 [HISTORY] Processing {len(cleaned_messages)} cleaned messages for UI display")
+            
+            for i, msg in enumerate(cleaned_messages):
+                if not hasattr(msg, 'content') or not msg.content:
+                    continue
+                    
+                if isinstance(msg, HumanMessage):
+                    # Process user messages
+                    content = self._clean_user_message(msg.content)
+                    if content and content not in seen_contents:
+                        seen_contents.add(content)
+                        conversation_pairs.append({"role": "user", "content": content})
+                        print(f"  📝 [HISTORY] Added user message: {content[:50]}...")
+                        
+                elif isinstance(msg, AIMessage):
+                    # Process assistant messages - filter out internal system messages
+                    if self._is_user_facing_message(msg.content):
+                        content = msg.content.strip()
+                        if content and content not in seen_contents:
+                            seen_contents.add(content)
+                            conversation_pairs.append({"role": "assistant", "content": content})
+                            print(f"  🤖 [HISTORY] Added assistant message: {content[:50]}...")
+                    else:
+                        print(f"  🚫 [HISTORY] Filtered internal message: {msg.content[:50]}...")
+            
+            print(f"📚 [HISTORY] Final conversation pairs: {len(conversation_pairs)}")
+            return conversation_pairs[-limit:] if conversation_pairs else []
 
         except Exception as e:
             print(f"Error getting conversation history: {e}")
             return []
+    
+    def _clean_user_message(self, content: str) -> str:
+        """Clean user message content by removing clarifying questions context"""
+        if not content:
+            return ""
+            
+        # Remove clarifying questions section if present
+        if "\n\nClarifying Questions and Answers:" in content:
+            content = content.split("\n\nClarifying Questions and Answers:")[0]
+        
+        return content.strip()
+    
+    def _is_user_facing_message(self, content: str) -> bool:
+        """Determine if an AI message should be shown to the user"""
+        if not content:
+            return False
+            
+        # Filter out internal system messages
+        internal_prefixes = [
+            "Evaluator Feedback",
+            "Planning Phase",
+            "Planner:",
+            "Worker:",
+            "Evaluator:",
+            "[PLANNING]",
+            "[EVALUATION]",
+            "[INTERNAL]"
+        ]
+        
+        for prefix in internal_prefixes:
+            if content.startswith(prefix):
+                return False
+                
+        # Filter out tool execution messages
+        if content.startswith("[Tools use]") or content.startswith("Tool execution"):
+            return False
+            
+        return True
+    
+    def _merge_conversation_with_deduplication(self, history: list, user_message: dict, assistant_message: dict) -> list:
+        """Merge new messages with existing history, avoiding duplicates"""
+        print(f"🔀 [MERGE] Starting deduplication with history length: {len(history)}")
+        print(f"🔀 [MERGE] New user message: {user_message['content'][:50]}...")
+        print(f"🔀 [MERGE] New assistant message: {assistant_message['content'][:50]}...")
+        
+        # Create a copy of history to work with
+        result = list(history) if history else []
+        
+        # Check if the user message already exists (by content)
+        user_content = user_message['content'].strip()
+        user_exists = any(
+            msg.get('role') == 'user' and msg.get('content', '').strip() == user_content 
+            for msg in result
+        )
+        
+        # Check if the assistant message already exists (by content)
+        assistant_content = assistant_message['content'].strip()
+        assistant_exists = any(
+            msg.get('role') == 'assistant' and msg.get('content', '').strip() == assistant_content 
+            for msg in result
+        )
+        
+        print(f"🔀 [MERGE] User message exists: {user_exists}, Assistant message exists: {assistant_exists}")
+        
+        # Only add messages that don't already exist
+        if not user_exists:
+            result.append(user_message)
+            print(f"✅ [MERGE] Added new user message")
+        else:
+            print(f"🚫 [MERGE] Skipped duplicate user message")
+            
+        if not assistant_exists:
+            result.append(assistant_message)
+            print(f"✅ [MERGE] Added new assistant message")
+        else:
+            print(f"🚫 [MERGE] Skipped duplicate assistant message")
+        
+        print(f"🔀 [MERGE] Final result length: {len(result)}")
+        return result
 
     # Validate and clean conversation history to prevent OpenAI API errors
     # Ensures tool calls are properly matched with tool responses

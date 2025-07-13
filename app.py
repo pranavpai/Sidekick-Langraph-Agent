@@ -138,7 +138,7 @@ async def generate_clarifying_questions(sidekick, message, success_criteria, cha
 
 # Main message processing function with clarifying answers
 # Second phase of processing workflow that includes clarifying context
-async def process_with_clarifying(sidekick, message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_questions):
+async def process_with_clarifying(sidekick, message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_questions, username, conversation_id):
     import time
     start_time = time.time()
     print(f"\n🔍 [CLARIFYING] Starting process_with_clarifying at {time.strftime('%H:%M:%S')}")
@@ -209,11 +209,12 @@ async def process_with_clarifying(sidekick, message, success_criteria, chatbot, 
         print(f"🚀 [CLARIFYING] Calling run_superstep at {time.strftime('%H:%M:%S')} (prep took {pre_superstep_time - start_time:.2f}s)")
 
         # Run the complete agent workflow with enhanced context
+        # Pass both original message (for storage) and enhanced message (for LLM processing)
         # Add Gradio-specific timeout protection (120 seconds)
         print("⏱️ [CLARIFYING] Starting run_superstep with 120s timeout protection...")
         try:
             results = await asyncio.wait_for(
-                sidekick.run_superstep(enhanced_message, success_criteria, chatbot),
+                sidekick.run_superstep(enhanced_message, success_criteria, chatbot, original_message=message),
                 timeout=120  # 2 minutes timeout to prevent Gradio connection issues
             )
         except TimeoutError:
@@ -231,9 +232,18 @@ async def process_with_clarifying(sidekick, message, success_criteria, chatbot, 
             print(f"⚠️ [CLARIFYING] Converting results to list, was: {type(results)}")
             results = []
 
+        # Refresh conversation dropdown to show updated title if it was auto-updated
+        try:
+            refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+            conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+            print(f"🔄 [CLARIFYING] Refreshed dropdown with {len(refreshed_conv_choices)} choices")
+        except Exception as e:
+            print(f"⚠️ [CLARIFYING] Error refreshing dropdown: {e}")
+            conversation_dropdown_update = gr.update()
+        
         # FIXED: Proper return format matching Gradio event handler expectations
-        # [chatbot, sidekick, clarifying_section, main_controls]
-        return results, sidekick, gr.update(visible=False), gr.update(visible=True)
+        # [chatbot, sidekick, clarifying_section, main_controls, conversation_list]
+        return results, sidekick, gr.update(visible=False), gr.update(visible=True), conversation_dropdown_update
 
     except Exception as e:
         error_time = time.time()
@@ -247,7 +257,8 @@ async def process_with_clarifying(sidekick, message, success_criteria, chatbot, 
             try:
                 fallback_start = time.time()
                 # Try direct processing with original message as fallback
-                fallback_results = await sidekick.run_superstep(message, success_criteria, chatbot)
+                # Use original message for both parameters since we're bypassing clarifying
+                fallback_results = await sidekick.run_superstep(message, success_criteria, chatbot, original_message=message)
                 fallback_end = time.time()
                 print(f"✅ [CLARIFYING] Fallback successful in {fallback_end - fallback_start:.2f}s")
 
@@ -263,7 +274,16 @@ async def process_with_clarifying(sidekick, message, success_criteria, chatbot, 
                 else:
                     enhanced_results = fallback_results
 
-                return enhanced_results, sidekick, gr.update(visible=False), gr.update(visible=True)
+                # Refresh conversation dropdown for fallback case too
+                try:
+                    refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+                    conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+                    print(f"🔄 [CLARIFYING] Fallback refreshed dropdown with {len(refreshed_conv_choices)} choices")
+                except Exception as e:
+                    print(f"⚠️ [CLARIFYING] Error refreshing dropdown in fallback: {e}")
+                    conversation_dropdown_update = gr.update()
+                
+                return enhanced_results, sidekick, gr.update(visible=False), gr.update(visible=True), conversation_dropdown_update
 
             except Exception as fallback_error:
                 print(f"❌ [CLARIFYING] Fallback also failed: {fallback_error}")
@@ -273,12 +293,19 @@ async def process_with_clarifying(sidekick, message, success_criteria, chatbot, 
             print("❌ [CLARIFYING] No sidekick available for fallback")
 
         # Final error state - ensure proper format
+        # Try to refresh conversation dropdown even on error
+        try:
+            refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+            conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+        except:
+            conversation_dropdown_update = gr.update()
+            
         error_message = {"role": "assistant", "content": "❌ Error: Processing failed. Please try resetting the conversation or logging out and back in."}
         error_history = chatbot + [error_message] if isinstance(chatbot, list) else [error_message]
-        return error_history, sidekick, gr.update(visible=False), gr.update(visible=True)
+        return error_history, sidekick, gr.update(visible=False), gr.update(visible=True), conversation_dropdown_update
 
 # Original process_message function for direct processing (skip clarifying questions)
-async def process_message_direct(sidekick, message, success_criteria, chatbot):
+async def process_message_direct(sidekick, message, success_criteria, chatbot, username, conversation_id):
     import time
     start_time = time.time()
     print(f"\n🔄 [DIRECT] Starting process_message_direct at {time.strftime('%H:%M:%S')}")
@@ -308,7 +335,8 @@ async def process_message_direct(sidekick, message, success_criteria, chatbot):
 
         # Run the complete agent workflow (worker-evaluator pattern)
         print(f"🚀 [DIRECT] Calling run_superstep at {time.strftime('%H:%M:%S')}")
-        results = await sidekick.run_superstep(message, success_criteria, chatbot)
+        # For direct processing, message is both the LLM input and storage input (no enhancement)
+        results = await sidekick.run_superstep(message, success_criteria, chatbot, original_message=message)
 
         # Log completion
         end_time = time.time()
@@ -320,8 +348,17 @@ async def process_message_direct(sidekick, message, success_criteria, chatbot):
             print(f"⚠️ [DIRECT] Converting results to list, was: {type(results)}")
             results = []
 
-        # Return updated chat history and agent state
-        return results, sidekick
+        # Refresh conversation dropdown to show updated title if it was auto-updated
+        try:
+            refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+            conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+            print(f"🔄 [DIRECT] Refreshed dropdown with {len(refreshed_conv_choices)} choices")
+        except Exception as e:
+            print(f"⚠️ [DIRECT] Error refreshing dropdown: {e}")
+            conversation_dropdown_update = gr.update()
+        
+        # Return updated chat history, agent state, and refreshed conversation dropdown
+        return results, sidekick, conversation_dropdown_update
 
     except Exception as e:
         error_time = time.time()
@@ -333,23 +370,67 @@ async def process_message_direct(sidekick, message, success_criteria, chatbot):
         if not isinstance(chatbot, list):
             chatbot = []
 
+        # Try to refresh conversation dropdown even on error
+        try:
+            refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+            conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+        except:
+            conversation_dropdown_update = gr.update()
+        
         # Return error state
         error_message = {"role": "assistant", "content": f"❌ Error: Processing failed. Please try resetting the conversation. Details: {e!s}"}
         error_history = chatbot + [error_message]
-        return error_history, sidekick
+        return error_history, sidekick, conversation_dropdown_update
 
 # Clear chat display function - only clears UI, preserves conversation history in DB
 # This gives users a clean visual interface without losing their data
 async def clear_chat_display(username=None, conversation_id=None):
-    """Clear chat display UI only - conversation history remains in database"""
-    print(f"\n🧹 [CLEAR_DISPLAY] Clearing chat display for user: {username}, conversation: {conversation_id[:8] if conversation_id else 'None'}...")
+    """Clear chat display and conversation history from database"""
+    print(f"\n🧹 [CLEAR_DISPLAY] Clearing chat display and history for user: {username}, conversation: {conversation_id[:8] if conversation_id else 'None'}...")
 
-    # Keep the existing Sidekick instance - don't recreate it
-    # This preserves the conversation state while just clearing the UI
-    print("✅ [CLEAR_DISPLAY] Chat display cleared - conversation history preserved in database")
+    conversation_dropdown_update = gr.update()  # Default no change
+    
+    if username and conversation_id:
+        # Actually clear the conversation history from the database
+        try:
+            result = memory_manager.clear_conversation_history(conversation_id, username)
+            if result["success"]:
+                print("✅ [CLEAR_DISPLAY] Conversation history cleared from database")
+                
+                # CRITICAL: Remove Sidekick instance from memory cache to prevent toggle behavior
+                session_key = f"{username}_{conversation_id}"
+                if session_key in active_sidekicks:
+                    # Properly cleanup the Sidekick instance
+                    try:
+                        active_sidekicks[session_key].cleanup()
+                        print(f"🧹 [CLEAR_DISPLAY] Cleaned up Sidekick instance for {session_key}")
+                    except Exception as cleanup_error:
+                        print(f"⚠️ [CLEAR_DISPLAY] Error during Sidekick cleanup: {cleanup_error}")
+                    
+                    # Remove from cache
+                    del active_sidekicks[session_key]
+                    print(f"🗑️ [CLEAR_DISPLAY] Removed Sidekick from cache: {session_key}")
+                else:
+                    print(f"ℹ️ [CLEAR_DISPLAY] No cached Sidekick found for {session_key}")
+                
+                # Refresh dropdown to show updated state (title reset to default, 0 messages)
+                try:
+                    refreshed_conv_choices, _ = await refresh_conversation_list(username, conversation_id)
+                    conversation_dropdown_update = gr.update(choices=refreshed_conv_choices, value=conversation_id)
+                    print(f"🔄 [CLEAR_DISPLAY] Refreshed dropdown after clear with {len(refreshed_conv_choices)} choices")
+                except Exception as e:
+                    print(f"⚠️ [CLEAR_DISPLAY] Error refreshing dropdown after clear: {e}")
+                    conversation_dropdown_update = gr.update()
+            else:
+                print(f"⚠️ [CLEAR_DISPLAY] Failed to clear history: {result['error']}")
+        except Exception as e:
+            print(f"❌ [CLEAR_DISPLAY] Error clearing history: {e}")
+    else:
+        print("⚠️ [CLEAR_DISPLAY] No username/conversation_id provided, only clearing UI")
 
-    # Return empty UI values but keep the agent instance unchanged
-    # The agent and DB conversation remain intact
+    print("✅ [CLEAR_DISPLAY] Chat display cleared")
+
+    # Return empty UI values and updated conversation dropdown
     return (
         "",                         # Clear message input
         "",                         # Clear success criteria input
@@ -358,7 +439,8 @@ async def clear_chat_display(username=None, conversation_id=None):
         "",                         # Clear Q2 answer
         "",                         # Clear Q3 answer
         gr.update(visible=False),   # Hide clarifying section
-        gr.update(visible=True)     # Show main controls
+        gr.update(visible=True),    # Show main controls
+        conversation_dropdown_update # Updated conversation dropdown
     )
 
 # Helper function to update clarifying questions display
@@ -652,10 +734,12 @@ def safe_dropdown_update(choices, target_value):
 async def refresh_conversation_list(username: str, selected_conversation_id: str = None):
     """Refresh conversation list with updated titles"""
     try:
+        print(f"🔄 [REFRESH_LIST] Starting refresh for user: {username}, selected: {selected_conversation_id[:8] if selected_conversation_id else 'None'}...")
+        
         conversations = memory_manager.get_user_conversations(username)
         conv_choices = []
 
-        print(f"🔄 Refreshing conversation list for {username}, found {len(conversations)} conversations")
+        print(f"🔄 [REFRESH_LIST] Found {len(conversations)} conversations for {username}")
 
         for i, conv in enumerate(conversations):
             # Truncate title if too long for better display
@@ -667,19 +751,21 @@ async def refresh_conversation_list(username: str, selected_conversation_id: str
             display_name = f"📝 {title} • {conv.message_count} msgs • {conv.last_updated.strftime('%m/%d %H:%M')}"
             conv_choices.append((display_name, conv.id))
 
-            print(f"  {i+1}. ID: {conv.id[:8]}... | Title: '{conv.title}' | Messages: {conv.message_count}")
+            print(f"  🔄 [REFRESH_LIST] {i+1}. ID: {conv.id[:8]}... | Title: '{conv.title}' | Messages: {conv.message_count}")
 
         # If no specific conversation selected, use the first one
         if not selected_conversation_id and conv_choices:
             selected_conversation_id = conv_choices[0][1]
-            print(f"✅ Auto-selected conversation: {selected_conversation_id[:8]}...")
+            print(f"✅ [REFRESH_LIST] Auto-selected conversation: {selected_conversation_id[:8]}...")
         elif selected_conversation_id:
-            print(f"✅ Using specified conversation: {selected_conversation_id[:8]}...")
+            print(f"✅ [REFRESH_LIST] Using specified conversation: {selected_conversation_id[:8]}...")
+        else:
+            print(f"⚠️ [REFRESH_LIST] No conversations available or selected")
 
-        print(f"📋 Created {len(conv_choices)} dropdown choices")
+        print(f"📋 [REFRESH_LIST] Created {len(conv_choices)} dropdown choices")
         return conv_choices, selected_conversation_id
     except Exception as e:
-        print(f"❌ Error refreshing conversation list: {e}")
+        print(f"❌ [REFRESH_LIST] Error refreshing conversation list: {e}")
         import traceback
         traceback.print_exc()
         return [], selected_conversation_id or ""
@@ -894,31 +980,31 @@ with gr.Blocks(title=APP_TITLE, theme=gr.themes.Default(primary_hue=APP_THEME)) 
 
     continue_button.click(
         process_with_clarifying,
-        [sidekick, message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_questions],
-        [chatbot, sidekick, clarifying_section, main_controls],
+        [sidekick, message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_questions, current_username, current_conversation_id],
+        [chatbot, sidekick, clarifying_section, main_controls, conversation_list],
         concurrency_limit=1
     )
 
     skip_clarifying_button.click(
         process_message_direct,
-        [sidekick, message, success_criteria, chatbot],
-        [chatbot, sidekick]
+        [sidekick, message, success_criteria, chatbot, current_username, current_conversation_id],
+        [chatbot, sidekick, conversation_list]
     ).then(
         lambda: (gr.update(visible=False), gr.update(visible=True)),
         [],
         [clarifying_section, main_controls]
     )
 
-    go_button.click(process_message_direct, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick])
+    go_button.click(process_message_direct, [sidekick, message, success_criteria, chatbot, current_username, current_conversation_id], [chatbot, sidekick, conversation_list])
 
-    message.submit(process_message_direct, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick])
+    message.submit(process_message_direct, [sidekick, message, success_criteria, chatbot, current_username, current_conversation_id], [chatbot, sidekick, conversation_list])
 
-    success_criteria.submit(process_message_direct, [sidekick, message, success_criteria, chatbot], [chatbot, sidekick])
+    success_criteria.submit(process_message_direct, [sidekick, message, success_criteria, chatbot, current_username, current_conversation_id], [chatbot, sidekick, conversation_list])
 
     reset_button.click(
         clear_chat_display,
         [current_username, current_conversation_id],
-        [message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_section, main_controls]
+        [message, success_criteria, chatbot, q1_answer, q2_answer, q3_answer, clarifying_section, main_controls, conversation_list]
     )
 
 # Configure Gradio queue to prevent browser timeouts for long-running operations
