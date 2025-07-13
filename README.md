@@ -87,7 +87,7 @@ graph TB
 
 - **Autonomous Task Execution**: Completes complex multi-step tasks independently
 - **Self-Evaluation**: Assesses task completion against user-defined success criteria
-- **Web Automation**: Browser automation using Playwright for web interactions
+- **Web Automation**: Browser automation using Playwright with automatic headless/headed mode detection
 - **File Management**: Secure file operations within a sandboxed environment
 - **Web Search**: Real-time web search capabilities via Google Serper API
 - **Python Execution**: Safe Python code execution environment
@@ -143,6 +143,8 @@ docker-compose up --build
 # Or run in development mode with live reload
 docker-compose --profile dev up --build
 ```
+
+**Note**: The application automatically detects Docker environments and runs the browser in headless mode. No additional configuration is needed for containerized deployment.
 
 #### Option 3: Traditional Python Installation
 
@@ -252,6 +254,19 @@ The agent behavior can be customized through `config.py`:
 - **Memory Settings**: Conversation history retention
 - **Browser Settings**: Playwright configuration options
 
+### Browser Configuration
+
+The application automatically configures the browser based on the environment:
+
+- **Local Development**: Browser runs in headed mode (visible) by default
+- **Docker/Containerized**: Browser automatically switches to headless mode
+- **No Display Environment**: Automatically detects and uses headless mode
+
+**Manual Override**: Set the `DISPLAY` environment variable to force headless mode:
+```bash
+export DISPLAY=  # Forces headless mode
+```
+
 ### Security Features
 
 - **Sandboxed Execution**: All file operations occur in `sandbox/` directory
@@ -288,6 +303,21 @@ The agent behavior can be customized through `config.py`:
 
 ### Common Issues
 
+#### Browser Configuration Issues
+
+**"Agent not initialized" Error**: Usually indicates browser startup failure.
+```bash
+# Check if the browser is properly configured
+docker logs sidekick-langraph-agent-sidekick-agent-1 | grep "Creating shared browser instance"
+# Should show: "🌐 Creating shared browser instance (headless=True)..." for Docker
+```
+
+**X Server Errors in Docker**: Indicates headless mode is not being used properly.
+```bash
+# Force headless mode if detection fails
+export DOCKER_ENV=true
+```
+
 #### Playwright Browser Issues
 ```bash
 # Reinstall Playwright browsers
@@ -315,8 +345,11 @@ uv sync --reinstall
 # Rebuild without cache
 docker-compose build --no-cache
 
-# Check logs
-docker-compose logs sidekick-agent
+# Check logs for browser initialization
+docker-compose logs sidekick-agent | grep -E "(browser|headless|DISPLAY)"
+
+# Restart container
+docker-compose restart sidekick-agent
 ```
 
 ### Performance Optimization

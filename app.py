@@ -25,9 +25,15 @@ class BrowserManager:
         """Get or create a shared browser instance"""
         if self.shared_browser is None:
             from playwright.async_api import async_playwright
-            print("🌐 Creating shared browser instance...")
+            import os
+            
+            # Use headless mode in Docker or when no display is available
+            is_docker = os.path.exists('/.dockerenv') or os.environ.get('DOCKER_ENV') == 'true'
+            headless_mode = is_docker or os.environ.get('DISPLAY') is None
+            
+            print(f"🌐 Creating shared browser instance (headless={headless_mode})...")
             self.shared_playwright = await async_playwright().start()
-            self.shared_browser = await self.shared_playwright.chromium.launch(headless=False)
+            self.shared_browser = await self.shared_playwright.chromium.launch(headless=headless_mode)
             print("✅ Shared browser instance created")
 
         self.reference_count += 1

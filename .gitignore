@@ -66,6 +66,9 @@ playwright-report/
 memory.db*
 *.sqlite3
 
+# Memory directory with user data and databases
+memory/
+
 # Sandbox directory files
 sandbox/
 
