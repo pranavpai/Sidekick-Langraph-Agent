@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  sidekick-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7860:7860"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
+      - PUSHOVER_USER=${PUSHOVER_USER}
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    volumes:
+      - ./memory:/app/memory
+      - ./sandbox:/app/sandbox
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:7860"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+  # Development service with live code reloading
+  sidekick-agent-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "7860:7860"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - SERPER_API_KEY=${SERPER_API_KEY}
+      - PUSHOVER_TOKEN=${PUSHOVER_TOKEN}
+      - PUSHOVER_USER=${PUSHOVER_USER}
+      - GRADIO_SERVER_NAME=0.0.0.0
+      - GRADIO_SERVER_PORT=7860
+    volumes:
+      - .:/app
+      - /app/.venv
+    restart: unless-stopped
+    profiles:
+      - dev

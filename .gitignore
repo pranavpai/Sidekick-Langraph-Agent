@@ -86,3 +86,15 @@ coverage.xml
 *.tmp
 *.bak
 *.orig
+
+# Docker
+.dockerignore
+docker-compose.override.yml
+
+# MyPy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
