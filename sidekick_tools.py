@@ -47,11 +47,18 @@ serper = GoogleSerperAPIWrapper()
 
 # Async function to initialize Playwright browser automation tools
 # Returns tools, browser instance, and playwright context for lifecycle management
-async def playwright_tools():
-    # Start Playwright async context manager
-    playwright = await async_playwright().start()
-    # Launch Chromium browser in non-headless mode for debugging visibility
-    browser = await playwright.chromium.launch(headless=False)
+async def playwright_tools(shared_browser=None, shared_playwright=None):
+    if shared_browser and shared_playwright:
+        # Use shared browser instance
+        print("🔄 Using shared browser instance for tools")
+        browser = shared_browser
+        playwright = shared_playwright
+    else:
+        # Create new browser instance (legacy behavior)
+        print("🆕 Creating new browser instance for tools")
+        playwright = await async_playwright().start()
+        browser = await playwright.chromium.launch(headless=False)
+
     # Create LangChain toolkit from browser instance
     toolkit = PlayWrightBrowserToolkit.from_browser(async_browser=browser)
     # Return tools list and browser objects for cleanup management
@@ -146,7 +153,7 @@ def markdown_to_pdf_sync(input_string: str) -> str:
 
     Input format: 
     - 'FILENAME:filename\nmarkdown_content' (explicit filename + content)
-    - 'filename.md' (auto-detects and reads file from sandbox)
+    - 'filename.md' or 'filename.txt' (auto-detects and reads file from sandbox)
     - 'markdown_content' (treats input as content)
     """
     try:
@@ -157,16 +164,21 @@ def markdown_to_pdf_sync(input_string: str) -> str:
             # Extract filename and remaining content
             filename = lines[0].replace('FILENAME:', '').strip()
             markdown_content = lines[1] if len(lines) > 1 else ""
-        elif (input_string.strip().endswith('.md') and 
+        elif ((input_string.strip().endswith('.md') or input_string.strip().endswith('.txt')) and
               '\n' not in input_string.strip() and
               os.path.exists(os.path.join('sandbox', input_string.strip()))):
             # Auto-detect filename and read content from sandbox
             filename_to_read = input_string.strip()
             try:
-                with open(os.path.join('sandbox', filename_to_read), 'r', encoding='utf-8') as f:
+                with open(os.path.join('sandbox', filename_to_read), encoding='utf-8') as f:
                     markdown_content = f.read()
-                # Generate PDF filename from markdown filename
-                filename = filename_to_read.replace('.md', '.pdf')
+                # Generate PDF filename from source filename
+                if filename_to_read.endswith('.md'):
+                    filename = filename_to_read.replace('.md', '.pdf')
+                elif filename_to_read.endswith('.txt'):
+                    filename = filename_to_read.replace('.txt', '.pdf')
+                else:
+                    filename = filename_to_read + '.pdf'
             except Exception as read_error:
                 return f"Error reading file {filename_to_read}: {read_error!s}"
         else:
@@ -213,7 +225,7 @@ async def other_tools():
     pdf_tool = Tool(
         name="markdown_to_pdf",
         func=markdown_to_pdf_sync,
-        description="Convert markdown to PDF. Input formats: 1) 'filename.md' (reads file from sandbox), 2) 'FILENAME:name\\nmarkdown_content' (explicit), 3) 'markdown_content' (direct content). PDFs saved to sandbox with relative paths."
+        description="Convert markdown to PDF. Input formats: 1) 'filename.md' or 'filename.txt' (reads file from sandbox), 2) 'FILENAME:name\\nmarkdown_content' (explicit), 3) 'markdown_content' (direct content). PDFs saved to sandbox with relative paths."
     )
 
     # Combine all tools into a single list for the agent

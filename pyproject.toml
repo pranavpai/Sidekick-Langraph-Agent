@@ -6,6 +6,7 @@ requires-python = ">=3.11"
 dependencies = [
     "gradio",
     "langgraph",
+    "langgraph-checkpoint-sqlite",
     "langchain-openai",
     "langchain-core",
     "langchain-community",
@@ -17,6 +18,7 @@ dependencies = [
     "requests",
     "typing-extensions",
     "wikipedia",
+    "bcrypt",
 ]
 
 [project.optional-dependencies]

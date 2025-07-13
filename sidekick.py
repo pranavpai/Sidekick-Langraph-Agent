@@ -1,26 +1,36 @@
 # Core type system for function annotations and graph state management
-from typing import Annotated
-from typing_extensions import TypedDict
-# LangGraph core components for building stateful agent workflows
-from langgraph.graph import StateGraph, START, END
-from langgraph.graph.message import add_messages  # Reducer for message accumulation
+import asyncio
+import uuid
+from datetime import datetime
+from typing import Annotated, Any
+
 from dotenv import load_dotenv
-# Pre-built LangGraph component for handling tool execution
-from langgraph.prebuilt import ToolNode
-# OpenAI LLM integration via LangChain
-from langchain_openai import ChatOpenAI
-# Memory persistence for maintaining conversation state across sessions
-from langgraph.checkpoint.memory import MemorySaver
+
 # LangChain message types for structured conversation handling
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from typing import List, Any, Optional, Dict
+
+# OpenAI LLM integration via LangChain
+from langchain_openai import ChatOpenAI
+
+# SQLite-based memory persistence for long-term conversation storage
+# LangGraph core components for building stateful agent workflows
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages  # Reducer for message accumulation
+
+# Pre-built LangGraph component for handling tool execution
+from langgraph.prebuilt import ToolNode
+
 # Pydantic for structured output validation and parsing
 from pydantic import BaseModel, Field
+from typing_extensions import TypedDict
+
+from config import ensure_directories
+
+# Local memory and auth management
+from memory_manager import memory_manager
+
 # Local tool definitions for browser automation and other capabilities
-from sidekick_tools import playwright_tools, other_tools
-import uuid
-import asyncio
-from datetime import datetime
+from sidekick_tools import other_tools, playwright_tools
 
 # Load environment variables for API keys and configuration
 load_dotenv(override=True)
@@ -29,11 +39,11 @@ load_dotenv(override=True)
 # This state is passed between all nodes and maintains the conversation context
 class State(TypedDict):
     # Message history with automatic accumulation via add_messages reducer
-    messages: Annotated[List[Any], add_messages]
+    messages: Annotated[list[Any], add_messages]
     # User-defined criteria for successful task completion
     success_criteria: str
     # Evaluator feedback on worker performance for iterative improvement
-    feedback_on_work: Optional[str]
+    feedback_on_work: str | None
     # Boolean flag indicating if the task has been completed successfully
     success_criteria_met: bool
     # Flag indicating if more user input is required to proceed
@@ -41,7 +51,7 @@ class State(TypedDict):
     # Counter to track worker-evaluator iterations
     iteration_count: int
     # High-level execution plan created by the planner
-    execution_plan: Optional[str]
+    execution_plan: str | None
     # Counter to track planner iterations for replanning scenarios
     planner_iterations: int
 
@@ -63,9 +73,9 @@ class PlannerOutput(BaseModel):
     # High-level strategy and approach for completing the task
     strategy: str = Field(description="Overall strategy and approach for the task")
     # Ordered list of specific steps the worker should execute
-    execution_steps: List[str] = Field(description="Ordered list of specific steps to complete the task")
+    execution_steps: list[str] = Field(description="Ordered list of specific steps to complete the task")
     # Tools and resources the worker should prioritize using
-    recommended_tools: List[str] = Field(description="Tools and resources the worker should use")
+    recommended_tools: list[str] = Field(description="Tools and resources the worker should use")
     # Key considerations, constraints, or requirements to keep in mind
     considerations: str = Field(description="Important considerations, constraints, or requirements")
 
@@ -73,7 +83,12 @@ class PlannerOutput(BaseModel):
 # Main Sidekick agent class implementing a worker-evaluator pattern with LangGraph
 # Combines task execution (worker) with quality assessment (evaluator) in a stateful workflow
 class Sidekick:
-    def __init__(self):
+    def __init__(self, username: str = None, conversation_id: str = None):
+        # User context for authentication and memory isolation
+        self.username = username
+        self.conversation_id = conversation_id
+        self.thread_id = None  # Will be set based on user context
+
         # Worker LLM bound with tools for task execution
         self.worker_llm_with_tools = None
         # Evaluator LLM configured for structured output assessment
@@ -86,21 +101,45 @@ class Sidekick:
         self.llm_with_tools = None
         # Compiled LangGraph workflow with nodes and edges
         self.graph = None
-        # Unique identifier for this agent instance and conversation thread
+        # Unique identifier for this agent instance (fallback for non-authenticated use)
         self.sidekick_id = str(uuid.uuid4())
-        # LangGraph memory persistence for maintaining state across interactions
-        self.memory = MemorySaver()
+        # SQLite-based memory persistence for long-term conversation storage
+        self.memory = None  # Will be initialized in setup()
         # Playwright browser instance for web automation
         self.browser = None
         # Playwright context manager for browser lifecycle
         self.playwright = None
+        # Flag to indicate if the browser and playwright are shared
+        self.using_shared_browser = False
 
     # Async initialization of all agent components and dependencies
-    async def setup(self):
-        # Initialize Playwright browser tools for web automation (non-headless)
-        self.tools, self.browser, self.playwright = await playwright_tools()
+    async def setup(self, shared_browser=None, shared_playwright=None):
+        # Ensure required directories exist
+        ensure_directories()
+
+        # Initialize SQLite-based memory persistence
+        self.memory = await memory_manager.get_checkpointer()
+
+        # Set up thread ID for user isolation
+        if self.username and self.conversation_id:
+            self.thread_id = memory_manager._format_thread_id(self.username, self.conversation_id)
+        else:
+            # Fallback to sidekick_id for non-authenticated use
+            self.thread_id = self.sidekick_id
+
+        # Initialize Playwright browser tools - use shared browser if provided
+        if shared_browser and shared_playwright:
+            print("🔄 [SETUP] Using shared browser instance")
+            self.tools, self.browser, self.playwright = await playwright_tools(shared_browser, shared_playwright)
+            self.using_shared_browser = True
+        else:
+            print("🆕 [SETUP] Creating new browser instance")
+            self.tools, self.browser, self.playwright = await playwright_tools()
+            self.using_shared_browser = False
+
         # Add additional tools: file management, search, notifications, Python REPL
         self.tools += await other_tools()
+
         # Create worker LLM instance with GPT-4o-mini for task execution
         worker_llm = ChatOpenAI(model="gpt-4o-mini")
         # Bind tools to worker LLM enabling function calling capabilities
@@ -118,9 +157,9 @@ class Sidekick:
 
     # Generate clarifying questions for user input
     # Uses LLM to create 3 relevant questions that could improve task understanding
-    async def generate_clarifying_questions(self, message: str, success_criteria: str) -> List[str]:
+    async def generate_clarifying_questions(self, message: str, success_criteria: str) -> list[str]:
         """Generate 3 clarifying questions based on user input to improve task understanding"""
-        
+
         # System prompt for clarifying questions generation
         system_prompt = """You are a helpful assistant that generates clarifying questions to better understand user requests.
         
@@ -149,16 +188,16 @@ Please generate 3 clarifying questions that would help you provide the best poss
             SystemMessage(content=system_prompt),
             HumanMessage(content=user_prompt)
         ]
-        
+
         try:
             # Use worker LLM (without tools) for question generation
             llm = ChatOpenAI(model="gpt-4o-mini")
             response = await llm.ainvoke(messages)
-            
+
             # Parse the response into individual questions
             questions_text = response.content.strip()
             questions = [q.strip() for q in questions_text.split('\n') if q.strip()]
-            
+
             # Ensure we have exactly 3 questions
             if len(questions) < 3:
                 # Pad with generic questions if needed
@@ -167,9 +206,9 @@ Please generate 3 clarifying questions that would help you provide the best poss
             elif len(questions) > 3:
                 # Take only the first 3 questions
                 questions = questions[:3]
-            
+
             return questions
-            
+
         except Exception as e:
             # Fallback questions if generation fails
             print(f"Error generating clarifying questions: {e}")
@@ -181,22 +220,22 @@ Please generate 3 clarifying questions that would help you provide the best poss
 
     # Planner node: Strategic planning component of the LangGraph workflow
     # Analyzes user request and creates detailed execution plan for the worker
-    def planner(self, state: State) -> Dict[str, Any]:
+    def planner(self, state: State) -> dict[str, Any]:
         """Generate strategic execution plan based on user request and available tools"""
         current_planner_iteration = state.get("planner_iterations", 0)
         current_iteration = state.get("iteration_count", 0)
-        
+
         # Extract the user's original request from messages
         original_request = ""
         for message in state["messages"]:
             if isinstance(message, HumanMessage):
                 original_request = message.content
                 break
-        
+
         # Create available tools list for planning context
         tool_names = [tool.name for tool in self.tools] if self.tools else []
         tools_description = ", ".join(tool_names)
-        
+
         # Dynamic system prompt for strategic planning
         system_message = f"""You are a strategic planner that creates detailed execution plans for an AI agent.
         
@@ -240,11 +279,11 @@ Consider what worked and what didn't work in the previous plan when creating the
             SystemMessage(content=system_message),
             HumanMessage(content=user_message)
         ]
-        
+
         try:
             # Invoke planner LLM with structured output
             plan_result = self.planner_llm_with_output.invoke(planner_messages)
-            
+
             # Format the plan into a comprehensive execution plan string
             execution_plan = f"""
 STRATEGY: {plan_result.strategy}
@@ -256,16 +295,16 @@ RECOMMENDED TOOLS: {', '.join(plan_result.recommended_tools)}
 
 CONSIDERATIONS: {plan_result.considerations}
             """.strip()
-            
+
             # Create plan summary message
             plan_message = f"Planning Phase: Created execution plan with {len(plan_result.execution_steps)} steps using strategy: {plan_result.strategy[:100]}..."
-            
+
             return {
                 "messages": [AIMessage(content=plan_message)],
                 "execution_plan": execution_plan,
                 "planner_iterations": current_planner_iteration + 1
             }
-            
+
         except Exception as e:
             # Fallback plan if planning fails
             fallback_plan = f"""
@@ -281,7 +320,7 @@ RECOMMENDED TOOLS: {tools_description}
 
 CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
             """.strip()
-            
+
             print(f"Error in planner: {e}")
             return {
                 "messages": [AIMessage(content=f"Planning Phase: Using fallback plan due to error: {str(e)[:100]}...")],
@@ -291,9 +330,9 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
 
     # Worker node: Core task execution component of the LangGraph workflow
     # Receives state, processes tasks with tools, and returns updated state
-    def worker(self, state: State) -> Dict[str, Any]:
+    def worker(self, state: State) -> dict[str, Any]:
         current_iteration = state.get("iteration_count", 0)
-        
+
         # Dynamic system prompt incorporating current context and success criteria
         system_message = f"""You are a helpful assistant that can use tools to complete tasks.
     You keep working on a task until either you have a question or clarification for the user, or the success criteria is met.
@@ -313,7 +352,7 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
 
     If you've finished, reply with the final answer, and don't ask a question; simply reply with the answer.
     """
-        
+
         # Include execution plan from planner if available
         if state.get("execution_plan"):
             system_message += f"""
@@ -324,7 +363,7 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
     {state['execution_plan']}
     
     Use this plan to structure your approach, but adapt as needed based on the actual results you encounter."""
-        
+
         # Include evaluator feedback for iterative improvement if available
         if state.get("feedback_on_work"):
             system_message += f"""
@@ -334,23 +373,28 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
     With this feedback, please continue the assignment, ensuring that you meet the success criteria or have a question for the user.
     
     NOTE: If you're repeating the same actions after {current_iteration} iterations, try a different approach or ask for clarification."""
-        
+
+        # Get messages from state and validate/clean them
+        messages = state["messages"]
+
+        # CRITICAL: Validate and clean messages to prevent OpenAI API errors
+        messages = self.validate_and_clean_messages(messages)
+
         # System message management: update existing or prepend new system message
         found_system_message = False
-        messages = state["messages"]
         # Search for existing system message to update with current context
         for message in messages:
             if isinstance(message, SystemMessage):
                 message.content = system_message
                 found_system_message = True
-        
+
         # Prepend system message if none exists in conversation history
         if not found_system_message:
             messages = [SystemMessage(content=system_message)] + messages
-        
+
         # Invoke worker LLM with tools, enabling function calling for task execution
         response = self.worker_llm_with_tools.invoke(messages)
-        
+
         # Return state update containing the LLM response (may include tool calls)
         return {
             "messages": [response],
@@ -362,17 +406,16 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
     def worker_router(self, state: State) -> str:
         # Examine the most recent message from the worker
         last_message = state["messages"][-1]
-        
+
         # If worker made tool calls, route to tools node for execution
         if hasattr(last_message, "tool_calls") and last_message.tool_calls:
             return "tools"
         # If no tool calls, route to evaluator for quality assessment
-        else:
-            return "evaluator"
-        
+        return "evaluator"
+
     # Utility function: Formats message history for evaluator context
     # Converts LangChain message objects into readable conversation text
-    def format_conversation(self, messages: List[Any]) -> str:
+    def format_conversation(self, messages: list[Any]) -> str:
         conversation = "Conversation history:\n\n"
         # Iterate through message history and format by sender type
         for message in messages:
@@ -383,7 +426,7 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
                 text = message.content or "[Tools use]"
                 conversation += f"Assistant: {text}\n"
         return conversation
-        
+
     # Evaluator node: Quality assessment component using structured output
     # Analyzes worker performance against success criteria and determines next actions
     def evaluator(self, state: State) -> State:
@@ -397,7 +440,7 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
     and whether more input is needed from the user.
     
     IMPORTANT: This is iteration {current_iteration}. If the iteration count is getting high (>15), be more lenient and consider accepting the work if it's reasonably complete, even if not perfect."""
-        
+
         # Comprehensive evaluation prompt with full conversation context
         user_message = f"""You are evaluating a conversation between the User and Assistant. You decide what action to take based on the last response from the Assistant.
 
@@ -423,18 +466,18 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
         if state["feedback_on_work"]:
             user_message += f"Also, note that in a prior attempt from the Assistant, you provided this feedback: {state['feedback_on_work']}\n"
             user_message += f"If you're seeing the Assistant repeating the same mistakes after {current_iteration} iterations, then consider responding that user input is required."
-        
+
         # Construct message sequence for evaluator LLM
         evaluator_messages = [SystemMessage(content=system_message), HumanMessage(content=user_message)]
 
         # Invoke evaluator with structured output, returns EvaluatorOutput Pydantic model
         eval_result = self.evaluator_llm_with_output.invoke(evaluator_messages)
-        
+
         # Force completion after too many iterations to prevent infinite loops
         if current_iteration >= 20:
             eval_result.success_criteria_met = True
             eval_result.feedback += f" [Auto-accepted after {current_iteration} iterations to prevent infinite loop]"
-        
+
         # Update state with evaluation results and workflow control flags
         new_state = {
             "messages": [{"role": "assistant", "content": f"Evaluator Feedback on this answer: {eval_result.feedback}"}],
@@ -451,41 +494,40 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
         # End workflow if task is complete or requires user intervention
         if state["success_criteria_met"] or state["user_input_needed"]:
             return "END"
-        
+
         current_iteration = state.get("iteration_count", 0)
         planner_iterations = state.get("planner_iterations", 0)
         feedback = state.get("feedback_on_work", "")
-        
+
         print(f"🔀 [ROUTING] Iteration {current_iteration}, Planner iterations: {planner_iterations}")
-        
+
         # AGGRESSIVE TIMEOUT PREVENTION: Force end after reasonable iterations
         if current_iteration >= 15:  # Reduced from 20 for faster timeout prevention
             print(f"⏰ [ROUTING] Force ending due to high iteration count: {current_iteration}")
             return "END"
-        
+
         # CONSERVATIVE REPLANNING: Only replan in very specific circumstances
         should_replan = False
-        
+
         # Only replan if we have clear indicators and low planner iterations
         if planner_iterations < 2:  # Reduced from 3 to limit replanning
             # Replan only at specific iteration thresholds (less frequent)
             if current_iteration == 7:  # Single replan opportunity instead of every 5
                 should_replan = True
                 print(f"🔄 [ROUTING] Replanning at iteration threshold: {current_iteration}")
-            
+
             # Replan if feedback explicitly suggests fundamental issues
             replan_keywords = ["different approach", "strategy", "plan", "reconsider", "rethink"]
             if feedback and any(keyword in feedback.lower() for keyword in replan_keywords):
                 should_replan = True
-                print(f"🔄 [ROUTING] Replanning due to feedback keywords")
-        
+                print("🔄 [ROUTING] Replanning due to feedback keywords")
+
         # Route based on decision
         if should_replan:
-            print(f"➡️ [ROUTING] Routing to planner")
+            print("➡️ [ROUTING] Routing to planner")
             return "planner"
-        else:
-            print(f"➡️ [ROUTING] Routing to worker")
-            return "worker"
+        print("➡️ [ROUTING] Routing to worker")
+        return "worker"
 
 
     # LangGraph workflow construction: Defines the agent's execution flow
@@ -525,10 +567,11 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
         import time
         start_time = time.time()
         print(f"\n🎯 [SUPERSTEP] Starting run_superstep at {time.strftime('%H:%M:%S')}")
-        
+        print(f"👤 [SUPERSTEP] User: {self.username}, Conversation: {self.conversation_id}, Thread: {self.thread_id}")
+
         try:
-            # Configuration for LangGraph execution with thread-based memory
-            config = {"configurable": {"thread_id": self.sidekick_id}}
+            # Configuration for LangGraph execution with user-specific thread-based memory
+            config = {"configurable": {"thread_id": self.thread_id}}
 
             # Initialize state for this execution cycle
             state = {
@@ -541,56 +584,174 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
                 "execution_plan": None,
                 "planner_iterations": 0
             }
-            
+
+            # Update conversation metadata if user context is available
+            if self.username and self.conversation_id:
+                # Auto-title conversation based on first message if it has default title
+                try:
+                    memory_manager.auto_title_conversation(
+                        self.conversation_id,
+                        self.username,
+                        message
+                    )
+                except Exception as e:
+                    print(f"Warning: Could not auto-title conversation: {e}")
+
+                # Update message count
+                memory_manager.update_conversation(
+                    self.conversation_id,
+                    self.username,
+                    increment_messages=True
+                )
+
             print(f"📊 [SUPERSTEP] State initialized with message length: {len(message) if message else 0}")
             print(f"📊 [SUPERSTEP] Success criteria: {success_criteria[:100] if success_criteria else 'Default'}...")
-            
+
             # Allow deep recursion for complex multi-step tasks - increased to handle planner-worker cycles
             config["recursion_limit"] = 200  # Increased for complex clarifying workflows
             print(f"⚙️ [SUPERSTEP] Config set with recursion_limit: {config['recursion_limit']}")
-            
+
             # Execute the compiled graph workflow asynchronously
             graph_start_time = time.time()
             print(f"🚀 [SUPERSTEP] Starting graph execution at {time.strftime('%H:%M:%S')}")
             result = await self.graph.ainvoke(state, config=config)
-            
+
             graph_end_time = time.time()
             print(f"✅ [SUPERSTEP] Graph execution completed at {time.strftime('%H:%M:%S')} (took {graph_end_time - graph_start_time:.2f}s)")
-            
+
             # Log result details
             print(f"📈 [SUPERSTEP] Result keys: {list(result.keys()) if result else 'None'}")
             print(f"📈 [SUPERSTEP] Final iteration count: {result.get('iteration_count', 'Unknown')}")
             print(f"📈 [SUPERSTEP] Planner iterations: {result.get('planner_iterations', 'Unknown')}")
             print(f"📈 [SUPERSTEP] Success criteria met: {result.get('success_criteria_met', 'Unknown')}")
             print(f"📈 [SUPERSTEP] Messages count: {len(result.get('messages', [])) if result else 0}")
-            
+
             # Format results for Gradio chat interface
             format_start_time = time.time()
             user = {"role": "user", "content": message}
             reply = {"role": "assistant", "content": result["messages"][-2].content}
             feedback = {"role": "assistant", "content": result["messages"][-1].content}
-            
+
             formatted_result = history + [user, reply, feedback]
             format_end_time = time.time()
-            
+
             print(f"🎨 [SUPERSTEP] Result formatting took {format_end_time - format_start_time:.2f}s")
-            
+
             total_time = time.time() - start_time
             print(f"🏁 [SUPERSTEP] Total run_superstep time: {total_time:.2f}s")
-            
+
             return formatted_result
-            
+
         except Exception as e:
             error_time = time.time()
             print(f"❌ [SUPERSTEP] Error at {time.strftime('%H:%M:%S')} (after {error_time - start_time:.2f}s): {e}")
             import traceback
             traceback.print_exc()
             raise e
-    
+
+    # Set user context for authenticated sessions
+    def set_user_context(self, username: str, conversation_id: str):
+        """Set user context for authentication and memory isolation"""
+        self.username = username
+        self.conversation_id = conversation_id
+        self.thread_id = memory_manager._format_thread_id(username, conversation_id)
+        print(f"👤 [CONTEXT] Set user context - Username: {username}, Conversation: {conversation_id}, Thread: {self.thread_id}")
+
+    # Get conversation history for UI display
+    async def get_conversation_history(self, limit: int = 50) -> list[dict[str, str]]:
+        """Get formatted conversation history for UI display"""
+        if not self.memory or not self.thread_id:
+            return []
+
+        try:
+            # Get checkpoints from memory
+            config = {"configurable": {"thread_id": self.thread_id}}
+            history = []
+
+            # Get the latest checkpoint
+            checkpoints = []
+            async for checkpoint in self.memory.alist(config, limit=limit):
+                checkpoints.append(checkpoint)
+
+            # Extract messages from checkpoints
+            raw_messages = []
+            for checkpoint in reversed(checkpoints[-limit:]):
+                if "messages" in checkpoint.checkpoint["channel_values"]:
+                    messages = checkpoint.checkpoint["channel_values"]["messages"]
+                    raw_messages.extend(messages)
+
+            # CRITICAL: Validate and clean messages before processing
+            cleaned_messages = self.validate_and_clean_messages(raw_messages)
+
+            # Format cleaned messages for UI display
+            for msg in cleaned_messages:
+                if hasattr(msg, 'content') and msg.content:
+                    if isinstance(msg, HumanMessage):
+                        history.append({"role": "user", "content": msg.content})
+                    elif isinstance(msg, AIMessage):
+                        history.append({"role": "assistant", "content": msg.content})
+
+            return history[-limit:] if history else []
+
+        except Exception as e:
+            print(f"Error getting conversation history: {e}")
+            return []
+
+    # Validate and clean conversation history to prevent OpenAI API errors
+    # Ensures tool calls are properly matched with tool responses
+    def validate_and_clean_messages(self, messages: list[Any]) -> list[Any]:
+        """Validate and clean message history to ensure tool calls have corresponding responses"""
+        if not messages:
+            return messages
+
+        cleaned_messages = []
+        pending_tool_calls = []
+
+        for message in messages:
+            if isinstance(message, AIMessage):
+                # Check if this message has tool calls
+                if hasattr(message, 'tool_calls') and message.tool_calls:
+                    # Track pending tool calls
+                    pending_tool_calls.extend([tool_call.get('id') for tool_call in message.tool_calls if tool_call.get('id')])
+                    cleaned_messages.append(message)
+                else:
+                    # Regular AI message without tool calls
+                    cleaned_messages.append(message)
+            elif hasattr(message, 'tool_call_id'):
+                # This is a tool response message
+                if message.tool_call_id in pending_tool_calls:
+                    # Valid tool response - remove from pending
+                    pending_tool_calls.remove(message.tool_call_id)
+                    cleaned_messages.append(message)
+                # If not in pending, this is an orphaned tool response - skip it
+            else:
+                # Regular message (HumanMessage, SystemMessage, etc.)
+                cleaned_messages.append(message)
+
+        # If we have pending tool calls at the end, remove the messages that created them
+        if pending_tool_calls:
+            print(f"⚠️ [VALIDATION] Found {len(pending_tool_calls)} unmatched tool calls, cleaning up...")
+            final_messages = []
+            for message in cleaned_messages:
+                if isinstance(message, AIMessage) and hasattr(message, 'tool_calls') and message.tool_calls:
+                    # Check if any of this message's tool calls are still pending
+                    message_tool_call_ids = [tool_call.get('id') for tool_call in message.tool_calls if tool_call.get('id')]
+                    if any(tool_id in pending_tool_calls for tool_id in message_tool_call_ids):
+                        # This message has unmatched tool calls, skip it
+                        print(f"⚠️ [VALIDATION] Removing message with unmatched tool calls: {message_tool_call_ids}")
+                        continue
+                final_messages.append(message)
+            cleaned_messages = final_messages
+
+        print(f"✅ [VALIDATION] Cleaned {len(messages)} messages -> {len(cleaned_messages)} messages")
+        return cleaned_messages
+
     # Resource cleanup: Properly closes browser and Playwright instances
     # Handles both event loop and non-event loop contexts gracefully
     def cleanup(self):
-        if self.browser:
+        # Only close browser if we're not using a shared instance
+        if self.browser and not self.using_shared_browser:
+            print("🧹 [CLEANUP] Closing individual browser instance")
             try:
                 # Try to use existing event loop for cleanup
                 loop = asyncio.get_running_loop()
@@ -602,3 +763,13 @@ CONSIDERATIONS: Ensure thoroughness and accuracy in task completion
                 asyncio.run(self.browser.close())
                 if self.playwright:
                     asyncio.run(self.playwright.stop())
+        elif self.using_shared_browser:
+            print("🔄 [CLEANUP] Using shared browser - not closing")
+
+        # Close memory checkpointer if needed
+        if self.memory and hasattr(self.memory, 'close'):
+            try:
+                loop = asyncio.get_running_loop()
+                loop.create_task(self.memory.close())
+            except (RuntimeError, AttributeError):
+                pass
